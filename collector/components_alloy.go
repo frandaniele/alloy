@@ -1,6 +1,8 @@
+// GENERATED CODE: DO NOT EDIT
+
 package main
 
-// Native Alloy components and features included in the Alloy binary.
+// Native Alloy components and features selected in alloy-components.yaml.
 import (
 	_ "github.com/grafana/alloy/internal/component/all"
 	_ "github.com/grafana/alloy/internal/converter/install"

@@ -1,0 +1,15 @@
+# Selects the native Alloy components compiled into the Alloy binary.
+# OpenTelemetry Collector components are selected in builder-config.yaml.
+
+# A list of native component names. A "*" in a name matches any characters, so
+# "prometheus.*" selects every prometheus component, and "*" selects every
+# component. Quote a name which starts with "*", because YAML reads an unquoted
+# "*" as an alias. For example:
+#   components: [local.file_match, loki.source.file, loki.process, loki.write]
+#   components: ["prometheus.*", loki.write]
+components: ["*"]
+
+# Include `alloy convert` and `alloy run --config.format`.
+# The converters depend on most native components, so set this to false when
+# you select only some components.
+converters: true

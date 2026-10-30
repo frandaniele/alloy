@@ -21,6 +21,7 @@
 ##   integration-test      Run integration tests
 ##   integration-test-k8s            Run Kubernetes integration tests (CI mode)
 ##   integration-test-k8s-local-dev  Run Kubernetes integration tests via interactive menu
+##   test-custom-builds    Build custom Alloy binaries, check their components, and log their sizes
 ##
 ## Targets for building binaries:
 ##
@@ -263,6 +264,13 @@ integration-test-k8s-local-dev:
 integration-test-windows-service: dist-alloy-installer-windows
 	cd integration-tests/windows-service && ALLOY_INSTALLER_PATH="../../dist/alloy-installer-windows-amd64.exe" \
 		$(GO_ENV) go test -v -tags="gore2regex alloyintegrationtests" -timeout 10m -run TestWindowsService ./...
+
+# Builds custom Alloy binaries with different alloy-components.yaml selections,
+# checks what each binary contains, and logs the binary sizes.
+.PHONY: test-custom-builds
+test-custom-builds: beyla
+	cd ./collector && $(GO_ENV) GO_TAGS="$(GO_TAGS)" BUILDER_VERSION=$(BUILDER_VERSION) \
+		go test -v -tags=alloycustombuild -timeout 120m ./custombuild
 
 .PHONY: test-pyroscope
 test-pyroscope:
