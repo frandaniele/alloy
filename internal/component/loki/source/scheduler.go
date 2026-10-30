@@ -51,8 +51,8 @@ func (s *Scheduler[Key]) ScheduleSource(source Source[Key]) {
 	})
 }
 
-// StopSource will unregister provided source and cancel it
-// without waiting for it to stop.
+// StopSource unregisters the provided source without waiting for it to stop.
+// Drainable sources finish their current work; all other sources are canceled.
 func (s *Scheduler[Key]) StopSource(source Source[Key]) {
 	k := source.Key()
 	scheduledTask, ok := s.sources[k]
@@ -60,6 +60,10 @@ func (s *Scheduler[Key]) StopSource(source Source[Key]) {
 		return
 	}
 	delete(s.sources, k)
+	if source, ok := scheduledTask.source.(DrainableSource[Key]); ok {
+		source.StopAndDrain()
+		return
+	}
 	scheduledTask.cancel()
 }
 
@@ -110,29 +114,75 @@ type Source[Key comparable] interface {
 	Key() Key
 }
 
+// DrainableSource is a source that can stop after finishing its current work.
+// StopAndDrain must not block. The source still needs to stop immediately when
+// the context passed to Run is canceled.
+type DrainableSource[Key comparable] interface {
+	Source[Key]
+	StopAndDrain()
+}
+
 // DebugSource is an optional interface with debug information.
 type DebugSource interface {
 	DebugInfo() any
 }
 
 func NewSourceWithRetry[Key comparable](source Source[Key], config backoff.Config) *SourceWithRetry[Key] {
-	return &SourceWithRetry[Key]{source, config}
+	drainCtx, stopAndDrain := context.WithCancel(context.Background())
+	return &SourceWithRetry[Key]{
+		source:       source,
+		config:       config,
+		drainCtx:     drainCtx,
+		stopAndDrain: stopAndDrain,
+	}
 }
 
 // SourceWithRetry is used to wrap another source and apply retries
 // when running.
 type SourceWithRetry[Key comparable] struct {
-	source Source[Key]
-	config backoff.Config
+	source       Source[Key]
+	config       backoff.Config
+	drainCtx     context.Context
+	stopAndDrain context.CancelFunc
 }
 
 func (s *SourceWithRetry[Key]) Run(ctx context.Context) {
-	backoff := backoff.New(ctx, s.config)
+	retryCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.drainCtx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	backoff := backoff.New(retryCtx, s.config)
 
 	for backoff.Ongoing() {
-		s.source.Run(ctx)
+		select {
+		case <-s.drainCtx.Done():
+			return
+		default:
+		}
+
+		if _, ok := s.source.(DrainableSource[Key]); ok {
+			s.source.Run(ctx)
+		} else {
+			s.source.Run(retryCtx)
+		}
+
+		select {
+		case <-s.drainCtx.Done():
+			return
+		default:
+		}
 		backoff.Wait()
 	}
+}
+
+func (s *SourceWithRetry[Key]) StopAndDrain() {
+	if source, ok := s.source.(DrainableSource[Key]); ok {
+		source.StopAndDrain()
+	}
+	s.stopAndDrain()
 }
 
 func (s *SourceWithRetry[Key]) Key() Key {

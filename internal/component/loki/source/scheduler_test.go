@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 )
 
 var _ Source[int] = (*testSource)(nil)
+var _ DrainableSource[int] = (*testDrainableSource)(nil)
 
 func newTestSource(key int, exit bool) *testSource {
 	return &testSource{
@@ -45,6 +47,36 @@ func (t *testSource) Key() int {
 
 func (t *testSource) IsRunning() bool {
 	return t.running.Load()
+}
+
+type testDrainableSource struct {
+	key       int
+	running   atomic.Bool
+	drained   atomic.Bool
+	aborted   atomic.Bool
+	drain     chan struct{}
+	drainOnce sync.Once
+}
+
+func newTestDrainableSource(key int) *testDrainableSource {
+	return &testDrainableSource{key: key, drain: make(chan struct{})}
+}
+
+func (t *testDrainableSource) Run(ctx context.Context) {
+	t.running.Store(true)
+	defer t.running.Store(false)
+	select {
+	case <-t.drain:
+		t.drained.Store(true)
+	case <-ctx.Done():
+		t.aborted.Store(true)
+	}
+}
+
+func (t *testDrainableSource) Key() int { return t.key }
+
+func (t *testDrainableSource) StopAndDrain() {
+	t.drainOnce.Do(func() { close(t.drain) })
 }
 
 func TestScheduler(t *testing.T) {
@@ -89,6 +121,30 @@ func TestScheduler(t *testing.T) {
 
 		scheduler.Stop()
 	})
+
+	t.Run("target removal drains a drainable source", func(t *testing.T) {
+		scheduler := NewScheduler[int]()
+		s := newTestDrainableSource(1)
+		scheduler.ScheduleSource(s)
+		require.Eventually(t, s.running.Load, time.Second, 10*time.Millisecond)
+
+		scheduler.StopSource(s)
+		require.Eventually(t, func() bool { return !s.running.Load() }, time.Second, 10*time.Millisecond)
+		require.True(t, s.drained.Load())
+		require.False(t, s.aborted.Load())
+		scheduler.Stop()
+	})
+
+	t.Run("scheduler shutdown aborts a drainable source", func(t *testing.T) {
+		scheduler := NewScheduler[int]()
+		s := newTestDrainableSource(1)
+		scheduler.ScheduleSource(s)
+		require.Eventually(t, s.running.Load, time.Second, 10*time.Millisecond)
+
+		scheduler.Stop()
+		require.True(t, s.aborted.Load())
+		require.False(t, s.drained.Load())
+	})
 }
 
 func TestScheduler_SourceWithRetry(t *testing.T) {
@@ -104,5 +160,22 @@ func TestScheduler_SourceWithRetry(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 	require.True(t, s.numStarts.Load() > 1)
+	scheduler.Stop()
+}
+
+func TestScheduler_SourceWithRetry_TargetRemovalStopsNonDrainableSource(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"))
+
+	scheduler := NewScheduler[int]()
+	s := newTestSource(1, false)
+	retrying := NewSourceWithRetry(s, backoff.Config{
+		MinBackoff: 20 * time.Millisecond,
+		MaxBackoff: time.Second,
+	})
+	scheduler.ScheduleSource(retrying)
+	require.Eventually(t, s.IsRunning, time.Second, 10*time.Millisecond)
+
+	scheduler.StopSource(retrying)
+	require.Eventually(t, func() bool { return !s.IsRunning() }, time.Second, 10*time.Millisecond)
 	scheduler.Stop()
 }
