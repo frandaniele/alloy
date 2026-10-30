@@ -39,7 +39,9 @@ type tailer struct {
 
 	running *atomic.Bool
 
-	componentStopping func() bool
+	drainCtx       context.Context
+	stopAndDrain   context.CancelFunc
+	drainCompleted atomic.Bool
 
 	report sync.Once
 
@@ -53,9 +55,10 @@ func newTailer(
 	logger *slog.Logger,
 	receiver loki.LogsReceiver,
 	pos positions.Positions,
-	componentStopping func() bool,
 	opts sourceOptions,
 ) *tailer {
+
+	drainCtx, stopAndDrain := context.WithCancel(context.Background())
 
 	return &tailer{
 		metrics:              metrics,
@@ -72,11 +75,16 @@ func newTailer(
 			MinPollFrequency: opts.fileWatch.MinPollFrequency,
 			MaxPollFrequency: opts.fileWatch.MaxPollFrequency,
 		},
-		componentStopping: componentStopping,
-		report:            sync.Once{},
-		encoding:          opts.encoding,
-		decompression:     opts.decompressionConfig,
+		drainCtx:      drainCtx,
+		stopAndDrain:  stopAndDrain,
+		report:        sync.Once{},
+		encoding:      opts.encoding,
+		decompression: opts.decompressionConfig,
 	}
+}
+
+func (t *tailer) StopAndDrain() {
+	t.stopAndDrain()
 }
 
 func (t *tailer) Run(ctx context.Context) {
@@ -181,7 +189,13 @@ func (t *tailer) tail(ctx context.Context, pos int64) {
 		entries             = t.receiver.Chan()
 		positionInterval    = t.positions.SyncPeriod()
 		lastUpdatedPosition = time.Time{}
+		draining            = false
+		drainDone           = t.drainCtx.Done()
+		drainPoll           = t.watcherConfig.MaxPollFrequency
 	)
+	if drainPoll <= 0 {
+		drainPoll = 250 * time.Millisecond
+	}
 
 	defer func() {
 		t.running.Store(false)
@@ -210,6 +224,15 @@ func (t *tailer) tail(ctx context.Context, pos int64) {
 
 	nextLine := func() (*tail.Line, error) {
 		for {
+			if drainDone != nil {
+				select {
+				case <-drainDone:
+					draining = true
+					drainDone = nil
+				default:
+				}
+			}
+
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -224,8 +247,34 @@ func (t *tailer) tail(ctx context.Context, pos int64) {
 			if t.decompression.Enabled {
 				return t.file.Flush()
 			}
+			if draining {
+				line, err := t.file.Flush()
+				if !errors.Is(err, io.EOF) {
+					return line, err
+				}
 
-			if err := t.file.Wait(ctx); err != nil {
+				pollCtx, cancel := context.WithTimeout(ctx, drainPoll)
+				err = t.file.Wait(pollCtx)
+				cancel()
+				if errors.Is(err, context.DeadlineExceeded) {
+					return nil, io.EOF
+				}
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			waitCtx, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(t.drainCtx, cancel)
+			err = t.file.Wait(waitCtx)
+			stop()
+			cancel()
+			if errors.Is(err, context.Canceled) && ctx.Err() == nil && t.drainCtx.Err() != nil {
+				draining = true
+				continue
+			}
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -236,25 +285,32 @@ func (t *tailer) tail(ctx context.Context, pos int64) {
 		if err != nil {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 				t.logger.Error("failed to tail file", "err", err)
+			} else if errors.Is(err, io.EOF) && draining {
+				t.drainCompleted.Store(true)
 			}
 			return
 		}
 
 		t.metrics.readLines.WithLabelValues(t.key.Path).Inc()
-		select {
-		case <-ctx.Done():
-			return
-		case entries <- loki.NewEntry(t.labels, push.Entry{
-			Timestamp: line.Time,
-			Line:      line.Text,
-		}):
-			lastOffset = line.Offset
-			if time.Since(lastUpdatedPosition) >= positionInterval {
-				lastUpdatedPosition = time.Now()
-				size, _ := t.file.Size()
-				t.updateStats(lastOffset, size)
+		entry := loki.NewEntry(t.labels, push.Entry{Timestamp: line.Time, Line: line.Text})
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-drainDone:
+				draining = true
+				drainDone = nil
+			case entries <- entry:
+				lastOffset = line.Offset
+				if time.Since(lastUpdatedPosition) >= positionInterval {
+					lastUpdatedPosition = time.Now()
+					size, _ := t.file.Size()
+					t.updateStats(lastOffset, size)
+				}
+				goto sent
 			}
 		}
+	sent:
 	}
 }
 
@@ -270,11 +326,11 @@ func (t *tailer) Key() positions.Entry {
 }
 
 func (t *tailer) shouldKeepPosition() bool {
-	// NOTE: We want to keep position if component is stopping or decompression is enabled.
-	// If component is not stopping that means that target is gone and we should no longer tail the file.
+	// Keep positions when the component is stopping so the source can resume on restart.
+	// A drain request means the target is gone and the position can be removed after EOF.
 	// If decompression is enabled we read file until we reach EOF and stop so tailer will exit, but we need
 	// to remember the position so that we don't re-ingest it on restart.
-	return t.componentStopping() || t.decompression.Enabled
+	return !t.drainCompleted.Load() || t.decompression.Enabled
 }
 
 // cleanupMetrics removes all metrics exported by this tailer

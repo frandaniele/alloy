@@ -7,12 +7,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -254,6 +256,142 @@ func TestUpdateRemoveFileWhileReading(t *testing.T) {
 		wg.Wait()
 		require.NoError(t, backgroundErr)
 	})
+}
+
+func TestTargetRemovalDrainsUnreadFile(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"))
+
+	f, err := os.CreateTemp(t.TempDir(), "target-removal")
+	require.NoError(t, err)
+	defer f.Close()
+
+	receiver := loki.NewLogsReceiver()
+	args := Arguments{
+		Targets: []discovery.Target{discovery.NewTargetFromMap(map[string]string{
+			"__path__": f.Name(),
+			"job":      "target-removal",
+		})},
+		ForwardTo: []loki.LogsReceiver{receiver},
+		FileWatch: FileWatch{MinPollFrequency: 10 * time.Millisecond, MaxPollFrequency: 10 * time.Millisecond},
+		FileMatch: FileMatch{SyncPeriod: 10 * time.Second},
+	}
+
+	component, err := New(component.Options{
+		Logger:        logging.NewSlogNop(),
+		Registerer:    prometheus.NewRegistry(),
+		OnStateChange: func(component.Exports) {},
+		DataPath:      t.TempDir(),
+	}, args)
+	require.NoError(t, err)
+
+	stop := componenttest.RunInBackground(t, component.Run)
+	defer stop()
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(component.metrics.filesActive) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	const lines = 1_000
+	for i := range lines {
+		lineEnding := "\n"
+		if i == lines-1 {
+			lineEnding = ""
+		}
+		_, err := fmt.Fprintf(f, "line=%d%s", i, lineEnding)
+		require.NoError(t, err)
+	}
+
+	// Do not consume the receiver yet. The first entry blocks the source and
+	// leaves the rest unread, reproducing downstream backpressure without a
+	// Loki dependency.
+	require.Eventually(t, func() bool {
+		read := testutil.ToFloat64(component.metrics.readLines.WithLabelValues(f.Name()))
+		return read > 0 && read < lines
+	}, 5*time.Second, 10*time.Millisecond)
+
+	args.Targets = nil
+	require.NoError(t, component.Update(args))
+
+	for i := range lines {
+		select {
+		case entry := <-receiver.Chan():
+			require.Equal(t, fmt.Sprintf("line=%d", i), entry.Line)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("received %d of %d lines after target removal", i, lines)
+		}
+	}
+}
+
+func TestTargetRemovalDrainsRotatedFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("renaming an open file behaves differently on Windows")
+	}
+	defer goleak.VerifyNone(t, goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"))
+
+	path := filepath.Join(t.TempDir(), "target-removal.log")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+
+	receiver := loki.NewLogsReceiver()
+	args := Arguments{
+		Targets: []discovery.Target{discovery.NewTargetFromMap(map[string]string{
+			"__path__": path,
+			"job":      "target-removal-rotation",
+		})},
+		ForwardTo: []loki.LogsReceiver{receiver},
+		FileWatch: FileWatch{MinPollFrequency: 10 * time.Millisecond, MaxPollFrequency: 10 * time.Millisecond},
+		FileMatch: FileMatch{SyncPeriod: 10 * time.Second},
+	}
+
+	component, err := New(component.Options{
+		Logger:        logging.NewSlogNop(),
+		Registerer:    prometheus.NewRegistry(),
+		OnStateChange: func(component.Exports) {},
+		DataPath:      t.TempDir(),
+	}, args)
+	require.NoError(t, err)
+
+	stop := componenttest.RunInBackground(t, component.Run)
+	defer stop()
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(component.metrics.filesActive) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	const linesPerFile = 500
+	for i := range linesPerFile {
+		_, err := fmt.Fprintf(f, "old=%d\n", i)
+		require.NoError(t, err)
+	}
+	require.NoError(t, f.Close())
+
+	require.Eventually(t, func() bool {
+		read := testutil.ToFloat64(component.metrics.readLines.WithLabelValues(path))
+		return read > 0 && read < linesPerFile
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, os.Rename(path, path+".1"))
+	f, err = os.Create(path)
+	require.NoError(t, err)
+	for i := range linesPerFile {
+		_, err := fmt.Fprintf(f, "new=%d\n", i)
+		require.NoError(t, err)
+	}
+	require.NoError(t, f.Close())
+
+	args.Targets = nil
+	require.NoError(t, component.Update(args))
+
+	for i := range linesPerFile * 2 {
+		want := fmt.Sprintf("old=%d", i)
+		if i >= linesPerFile {
+			want = fmt.Sprintf("new=%d", i-linesPerFile)
+		}
+		select {
+		case entry := <-receiver.Chan():
+			require.Equal(t, want, entry.Line)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("received %d of %d lines after target removal", i, linesPerFile*2)
+		}
+	}
 }
 
 func TestFileWatch(t *testing.T) {

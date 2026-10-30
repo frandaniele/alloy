@@ -41,7 +41,6 @@ func TestTailer(t *testing.T) {
 		l,
 		ch1,
 		positionsFile,
-		func() bool { return true },
 		sourceOptions{
 			path:   logFile.Name(),
 			labels: labels,
@@ -138,7 +137,6 @@ func TestTailerPositionFileEntryDeleted(t *testing.T) {
 		l,
 		ch1,
 		positionsFile,
-		func() bool { return false },
 		sourceOptions{
 			path:   logFile.Name(),
 			labels: labels,
@@ -172,8 +170,9 @@ func TestTailerPositionFileEntryDeleted(t *testing.T) {
 		assert.Equal(c, int64(18), pos)
 	}, time.Second, 50*time.Millisecond)
 
-	cancel()
+	tailer.StopAndDrain()
 	<-done
+	cancel()
 
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		pos, err := positionsFile.Get(logFile.Name(), labels.String())
@@ -208,7 +207,6 @@ func TestTailerDeleteFileInstant(t *testing.T) {
 		l,
 		ch1,
 		positionsFile,
-		func() bool { return true },
 		sourceOptions{
 			path:   logFile.Name(),
 			labels: labels,
@@ -276,7 +274,6 @@ func TestTailerCancelWhileSendBlocked(t *testing.T) {
 		l,
 		recv,
 		positionsFile,
-		func() bool { return true },
 		sourceOptions{
 			path:   path,
 			labels: labels,
@@ -340,7 +337,6 @@ func TestTailerCorruptedPositions(t *testing.T) {
 		l,
 		ch1,
 		positionsFile,
-		func() bool { return true },
 		sourceOptions{
 			path:   logFile.Name(),
 			labels: labels,
@@ -440,8 +436,6 @@ func TestTailer_Compressions(t *testing.T) {
 		logger,
 		handler.Receiver(),
 		positionsFile,
-		// We return false here to verify that position is kept and we don't re-ingest the file.
-		func() bool { return false },
 		sourceOptions{
 			path:                 filename,
 			labels:               labels,
@@ -484,7 +478,6 @@ func TestTailer_GigantiqueGunzipFile(t *testing.T) {
 		logging.NewSlogNop(),
 		handler.Receiver(),
 		positions.NewNop(),
-		func() bool { return false },
 		sourceOptions{
 			path:                file,
 			decompressionConfig: DecompressionConfig{Enabled: true, Format: "gz"},
@@ -514,7 +507,6 @@ func TestTailer_CompressedOnelineFile(t *testing.T) {
 			logging.NewSlogNop(),
 			handler.Receiver(),
 			positions.NewNop(),
-			func() bool { return false },
 			sourceOptions{
 				path:                file,
 				decompressionConfig: DecompressionConfig{Enabled: true, Format: "gz"},
@@ -543,7 +535,6 @@ func TestTailer_CompressedOnelineFile(t *testing.T) {
 			logging.NewSlogNop(),
 			handler.Receiver(),
 			positions.NewNop(),
-			func() bool { return false },
 			sourceOptions{
 				path:                file,
 				decompressionConfig: DecompressionConfig{Enabled: true, Format: "bz2"},
@@ -571,7 +562,6 @@ func TestTailer_CompressedOnelineFile(t *testing.T) {
 			logging.NewSlogNop(),
 			handler.Receiver(),
 			positions.NewNop(),
-			func() bool { return false },
 			sourceOptions{
 				path:                file,
 				decompressionConfig: DecompressionConfig{Enabled: true, Format: "gz"},

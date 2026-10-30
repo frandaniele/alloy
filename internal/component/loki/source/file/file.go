@@ -15,7 +15,6 @@ import (
 
 	"github.com/grafana/dskit/backoff"
 	"github.com/prometheus/common/model"
-	"go.uber.org/atomic"
 
 	"github.com/grafana/alloy/internal/component"
 	"github.com/grafana/alloy/internal/component/common/loki"
@@ -204,8 +203,6 @@ type Component struct {
 	posFile positions.Positions
 
 	fanout *loki.Fanout
-
-	stopping atomic.Bool
 }
 
 // New creates a new loki.source.file component.
@@ -253,8 +250,6 @@ func New(o component.Options, args Arguments) (*Component, error) {
 func (c *Component) Run(ctx context.Context) error {
 	defer func() {
 		c.opts.Logger.Info("loki.source.file component shutting down, stopping sources and positions file")
-		c.stopping.Store(true)
-
 		c.mut.Lock()
 		defer c.mut.Unlock()
 		c.watcher.Stop()
@@ -404,7 +399,6 @@ func (c *Component) newSource(opts sourceOptions) (source.Source[positions.Entry
 		c.opts.Logger,
 		c.handler,
 		c.posFile,
-		c.IsStopping,
 		opts,
 	)
 
@@ -417,8 +411,4 @@ func (c *Component) newSource(opts sourceOptions) (source.Source[positions.Entry
 		MinBackoff: 1 * time.Second,
 		MaxBackoff: 10 * time.Second,
 	}), nil
-}
-
-func (c *Component) IsStopping() bool {
-	return c.stopping.Load()
 }
